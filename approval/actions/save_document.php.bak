@@ -1,0 +1,114 @@
+<?php
+require_once __DIR__ . '/../includes/bootstrap.php';
+$pageUser = require_login($pdo);
+if (is_super_admin($pageUser)) {
+    set_flash('error', '최상위 관리자는 문서를 직접 기안하지 않습니다.');
+    redirect_to('index.php');
+}
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') { redirect_to('documents.php?view=all'); }
+verify_csrf_or_fail();
+$documentId = (int) ($_POST['document_id'] ?? 0);
+$title = trim((string) ($_POST['title'] ?? ''));
+$content = trim((string) ($_POST['content'] ?? ''));
+$submitAction = $_POST['submit_action'] ?? 'save';
+$categoryId = max(0, (int) ($_POST['category_id'] ?? 0));
+$templateId = max(0, (int) ($_POST['template_id'] ?? 0));
+$readerIds = $_POST['reader_ids'] ?? [];
+if (!is_array($readerIds)) {
+    $readerIds = [];
+}
+if ($title === '' || $content === '') {
+    set_flash('error', '제목과 내용을 입력하세요.');
+    redirect_to($documentId > 0 ? 'document_edit.php?id=' . $documentId : 'document_create.php');
+}
+if ($documentId === 0 && !company_has_capacity($pdo, (int) $pageUser['company_id'], 'document')) {
+    set_flash('error', '현재 회사 플랜의 문서 저장 한도를 초과했습니다.');
+    redirect_to('documents.php?view=all');
+}
+$companyId = (int) $pageUser['company_id'];
+if ($categoryId > 0) {
+    $validCategory = false;
+    foreach (get_company_categories($pdo, $companyId) as $category) {
+        if ((int) $category['id'] === $categoryId) {
+            $validCategory = true;
+            break;
+        }
+    }
+    if (!$validCategory) {
+        set_flash('error', '선택한 문서 분류가 유효하지 않습니다.');
+        redirect_to($documentId > 0 ? 'document_edit.php?id=' . $documentId : 'document_create.php');
+    }
+}
+if ($templateId > 0) {
+    $template = get_template_by_id($pdo, $templateId);
+    if (!$template || (int) ($template['company_id'] ?? 0) !== $companyId || (int) ($template['is_active'] ?? 0) !== 1) {
+        set_flash('error', '선택한 결재선 템플릿이 유효하지 않습니다.');
+        redirect_to($documentId > 0 ? 'document_edit.php?id=' . $documentId : 'document_create.php');
+    }
+}
+
+try {
+    $pdo->beginTransaction();
+    $isResubmit = false;
+    if ($documentId > 0) {
+        $document = get_document($pdo, $documentId);
+        if (!$document || !can_edit_document($pdo, $pageUser, $document)) {
+            throw new RuntimeException('문서를 수정할 권한이 없습니다.');
+        }
+        if ($document['status'] === 'rejected' && $submitAction === 'submit') {
+            save_revision_snapshot($pdo, $documentId, (int) $document['version_no'], $document['title'], $document['content'], (int) $pageUser['id']);
+            $isResubmit = true;
+        }
+        $versionNo = (int) $document['version_no'] + ($isResubmit ? 1 : 0);
+        $status = $submitAction === 'submit' ? 'submitted' : 'draft';
+        $stmt = $pdo->prepare('UPDATE `approval_documents` SET category_id = ?, template_id = ?, title = ?, content = ?, status = ?, version_no = ?, current_step = NULL, completed_at = NULL, cancel_reason = NULL, submitted_at = ?, updated_at = NOW() WHERE id = ?');
+        $stmt->execute([$categoryId > 0 ? $categoryId : null, $templateId > 0 ? $templateId : null, $title, $content, $status, $versionNo, $submitAction === 'submit' ? now_string() : null, $documentId]);
+    } else {
+        $status = $submitAction === 'submit' ? 'submitted' : 'draft';
+        $stmt = $pdo->prepare('INSERT INTO `approval_documents` (company_id, category_id, template_id, doc_no, writer_id, title, content, status, current_step, version_no, status_before_delete, submitted_at, completed_at, cancel_reason, deleted_at, deleted_by, delete_reason, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, 1, NULL, ?, NULL, NULL, NULL, NULL, NULL, NOW(), NOW())');
+        $stmt->execute([$companyId, $categoryId > 0 ? $categoryId : null, $templateId > 0 ? $templateId : null, (int) $pageUser['id'], $title, $content, $status, $submitAction === 'submit' ? now_string() : null]);
+        $documentId = (int) $pdo->lastInsertId();
+        ensure_document_number($pdo, $documentId);
+    }
+
+    $validReaders = [];
+    $validReaderIds = array_map(static fn(array $row): int => (int) $row['id'], get_company_members_for_reader($pdo, $companyId, (int) $pageUser['id']));
+    foreach ($readerIds as $readerId) {
+        $readerId = (int) $readerId;
+        if (in_array($readerId, $validReaderIds, true)) {
+            $validReaders[] = $readerId;
+        }
+    }
+    sync_document_readers($pdo, $documentId, $validReaders);
+
+    if (!empty($_FILES['attachments'])) {
+        persist_uploaded_files($pdo, $documentId, $_FILES['attachments']);
+    }
+
+    $successMessage = '문서가 저장되었습니다.';
+    if ($submitAction === 'submit') {
+        $flow = create_approval_steps($pdo, $documentId, (int) $pageUser['id'], $templateId > 0 ? $templateId : null);
+        $pdo->prepare('UPDATE `approval_documents` SET status = ?, current_step = ?, submitted_at = NOW(), completed_at = CASE WHEN ? = "approved" THEN NOW() ELSE NULL END, updated_at = NOW() WHERE id = ?')->execute([$flow['status'], $flow['current_step'], $flow['status'], $documentId]);
+        $currentDocument = get_document($pdo, $documentId);
+        log_document_action($pdo, $documentId, (int) $pageUser['id'], $isResubmit ? 'resubmitted' : 'submitted', $isResubmit ? '반려 문서 재기안' : '문서 기안');
+        log_activity($pdo, $pageUser, $companyId, $isResubmit ? 'document_resubmitted' : 'document_submitted', '[' . ($currentDocument['doc_no'] ?: generate_document_no($documentId)) . '] ' . $title, 'document', $documentId);
+        if ($flow['status'] === 'approved') {
+            notify_writer($pdo, $documentId, 'approved', '문서 결재가 완료되었습니다', '[' . ($currentDocument['doc_no'] ?: '-') . '] ' . $currentDocument['title'] . ' 문서가 자동 승인되었습니다.');
+            $successMessage = '문서가 자동 승인되었습니다.';
+        } else {
+            notify_next_pending_approver($pdo, $documentId);
+            $successMessage = '문서가 기안되었습니다.';
+        }
+    } else {
+        $pdo->prepare('DELETE FROM `approval_approval_steps` WHERE document_id = ?')->execute([$documentId]);
+        log_document_action($pdo, $documentId, (int) $pageUser['id'], 'saved', '임시저장');
+        log_activity($pdo, $pageUser, $companyId, 'document_saved', '[' . generate_document_no($documentId) . '] ' . $title, 'document', $documentId);
+    }
+    $pdo->commit();
+    set_flash('success', $successMessage);
+    redirect_to('document_view.php?id=' . $documentId);
+} catch (Throwable $e) {
+    if ($pdo->inTransaction()) { $pdo->rollBack(); }
+    set_flash('error', $e->getMessage());
+    redirect_to($documentId > 0 ? 'document_edit.php?id=' . $documentId : 'document_create.php');
+}
