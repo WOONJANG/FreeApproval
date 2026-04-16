@@ -9,9 +9,9 @@ define('DEFAULT_LOCALE', 'ko');
 define('PASSWORD_RESET_TOKEN_MINUTES', 20);
 
 define('DB_HOST', 'localhost');
-define('DB_NAME', 'wooniverse');
-define('DB_USER', 'wooniverse');
-define('DB_PASS', 'jw950518@');
+define('DB_NAME', 'YOUR_DB_NAME'); // 개발자 작성하는 곳
+define('DB_USER', 'YOUR_DB_USER'); // 개발자 작성하는 곳
+define('DB_PASS', 'YOUR_DB_PASS'); // 개발자 작성하는 곳
 define('DB_CHARSET', 'utf8mb4');
 
 define('BASE_URL', '/approval');
